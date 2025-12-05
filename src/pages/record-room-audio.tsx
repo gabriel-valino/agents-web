@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 const isRecordingSupported =
   !!navigator.mediaDevices &&
   typeof navigator.mediaDevices.getUserMedia === 'function' &&
-  typeof window.MediaRecorder === 'function'
+  typeof window.MediaRecorder !== 'undefined'
 
 type RoomParams = {
   roomId: string
@@ -17,7 +17,10 @@ export function RecordRoomAudio() {
   const params = useParams<RoomParams>()
   const [isRecording, setIsRecording] = useState(false)
   const recorder = useRef<MediaRecorder | null>(null)
-  const intervalRef = useRef<NodeJS.Timeout>(null)
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const uploadQueue = useRef<Blob[]>([])
+  const processingQueue = useRef(false)
+  const collectedChunks = useRef<Blob[]>([])
 
   if (!params.roomId) {
     return <Navigate replace to="/" />
@@ -37,8 +40,9 @@ export function RecordRoomAudio() {
 
   async function uploadAudio(audio: Blob) {
     const formData = new FormData()
+    const filename = `audio-${Date.now()}.webm`
 
-    formData.append('file', audio, 'audio.webm')
+    formData.append('file', audio, filename)
 
     const response = await fetch(
       `${import.meta.env.VITE_API_URL}/rooms/${params.roomId}/audio`,
@@ -48,20 +52,40 @@ export function RecordRoomAudio() {
       }
     )
 
-    const result = await response.json()
+    if (!response.ok) {
+      const text = await response.text().catch(() => '')
+      throw new Error(`Upload failed: ${response.status} ${text}`)
+    }
 
-    console.log(result)
+    return response.json()
   }
 
-  function createRecorder(audio: MediaStream) {
-    recorder.current = new MediaRecorder(audio, {
-      mimeType: 'audio/webm',
+  function createRecorder(stream: MediaStream) {
+    const preferred = 'audio/webm'
+    let mimeType: string | undefined
+
+    const mr = MediaRecorder as unknown as {
+      isTypeSupported?: (t: string) => boolean
+    }
+    if (typeof mr.isTypeSupported === 'function') {
+      const supported = mr.isTypeSupported(preferred)
+      if (supported) {
+        mimeType = preferred
+      }
+    }
+
+    recorder.current = new MediaRecorder(stream, {
+      mimeType,
       audioBitsPerSecond: 64_000,
     })
 
     recorder.current.ondataavailable = (event) => {
       if (event.data.size > 0) {
-        uploadAudio(event.data)
+        // enqueue and let the queue processor handle uploads
+        uploadQueue.current.push(event.data)
+        // also collect for final merged upload
+        collectedChunks.current.push(event.data)
+        processQueue().catch((err) => console.error('Queue process error', err))
       }
     }
 
@@ -71,9 +95,75 @@ export function RecordRoomAudio() {
 
     recorder.current.onstop = () => {
       console.log('Gravação encerrada/pausada')
+
+      async function handleFullUpload() {
+        try {
+          if (collectedChunks.current.length === 0) {
+            return
+          }
+
+          const full = new Blob(collectedChunks.current, { type: 'audio/webm' })
+          await uploadFullAudio(full)
+        } catch (err) {
+          console.error('Failed to upload full audio', err)
+        } finally {
+          collectedChunks.current = []
+        }
+      }
+
+      handleFullUpload()
+    }
+    // Start continuous recording. We'll call requestData() on an interval to
+    // emit chunks via ondataavailable without stopping the recorder.
+    recorder.current.start()
+  }
+
+  function processQueue(): Promise<void> {
+    if (processingQueue.current) {
+      return Promise.resolve()
     }
 
-    recorder.current.start()
+    processingQueue.current = true
+
+    // take a snapshot of current queue and clear it so new items can be enqueued
+    const items = uploadQueue.current.splice(0)
+
+    let chain = Promise.resolve()
+
+    for (const blob of items) {
+      chain = chain
+        .then(() => uploadAudio(blob))
+        .catch((err) => {
+          console.error('Upload failed, retrying', err)
+          uploadQueue.current.unshift(blob)
+          return new Promise((res) => setTimeout(res, 1000))
+        })
+    }
+
+    return chain.finally(() => {
+      processingQueue.current = false
+    })
+  }
+
+  async function uploadFullAudio(audio: Blob) {
+    const form = new FormData()
+    const filename = `audio-full-${Date.now()}.webm`
+    form.append('file', audio, filename)
+
+    const resp = await fetch(
+      `${import.meta.env.VITE_API_URL}/rooms/${params.roomId}/audio/full`,
+      {
+        method: 'POST',
+        body: form,
+      }
+    )
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '')
+      throw new Error(`Full upload failed: ${resp.status} ${text}`)
+    }
+
+    return resp.json()
   }
 
   async function startRecording() {
@@ -94,10 +184,17 @@ export function RecordRoomAudio() {
 
     createRecorder(audio)
 
-    intervalRef.current = setInterval(() => {
-      recorder.current?.stop()
+    // requestData will trigger ondataavailable, so call it every 5s
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current)
+    }
 
-      createRecorder(audio)
+    intervalRef.current = setInterval(() => {
+      try {
+        recorder.current?.requestData()
+      } catch (err) {
+        console.error('Failed to request data from recorder', err)
+      }
     }, 5000)
   }
 
