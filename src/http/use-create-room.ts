@@ -7,7 +7,7 @@ export function useCreateRoom() {
 
   return useMutation({
     mutationFn: async (data: CreateRoomRequest) => {
-      const response = await fetch('http://localhost:3333/rooms', {
+      const response = await fetch(`${import.meta.env.VITE_API_URL}/rooms`, {
         method: 'POST',
         headers: {
           'Content-type': 'application/json',
